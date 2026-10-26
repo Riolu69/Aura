@@ -1,0 +1,482 @@
+//
+//  StreamCoordinator.swift
+//  MovieStream
+//
+
+import Foundation
+import Observation
+#if DEBUG
+import OSLog
+#endif
+
+// MARK: - Встроенный переводчик для системных сообщений
+fileprivate func tr(_ key: String) -> String {
+    let lang = UserDefaults.standard.string(forKey: "appLanguage") ?? "ru"
+    guard lang == "ru" else { return key }
+    let dict: [String: String] = [
+        "Connecting to sources…": "Подключение к источникам…",
+        "Trying the next best source…": "Пробуем следующий источник…",
+        "Fetching sources from peers…": "Поиск источников у пиров…",
+        "Starting stream…": "Запуск видео…",
+        "This torrent link could not be started. Try a different source.": "Не удалось запустить этот торрент. Попробуйте другой источник.",
+        "Couldn’t reach enough peers for this release. Try a different source; one with more seeders usually connects faster.": "Не удалось найти достаточно пиров. Выберите раздачу с бóльшим количеством сидов.",
+        "This release has no playable video file.": "В этой раздаче нет поддерживаемого видеофайла.",
+        "This release isn’t serving data — no seeders reachable right now. Try another source with more seeders.": "Нет данных от сидов. Попробуйте другой источник."
+    ]
+    
+    if key.contains(" source") && key.contains(" · ") {
+        var str = key.replacingOccurrences(of: " sources", with: " источников")
+        str = str.replacingOccurrences(of: " source", with: " источник")
+        return str
+    }
+    
+    return dict[key] ?? key
+}
+
+@MainActor
+@Observable
+final class StreamCoordinator {
+    struct Target: Identifiable, Equatable {
+        let url: URL
+        let title: String
+        let showsTorrentStats: Bool
+        var subtitleContext: SubtitleContext?
+        var startPosition: Duration = .zero
+        var progress: WatchProgressContext?
+        var originalAudioLanguage: String?
+
+        var id: URL { url }
+        
+        // MARK: - Проверка поддержки формата для нативного Apple Плеера (PiP, AirPlay)
+        var isAppleSupported: Bool {
+            let ext = url.pathExtension.lowercased()
+            return ["mp4", "m4v", "mov", "m3u8"].contains(ext)
+        }
+    }
+
+    private(set) var isPresenting = false
+    private(set) var target: Target?
+    private(set) var preparing: String?
+    private(set) var bufferProgress: Double?
+    private(set) var errorMessage: String?
+
+    private(set) var title = ""
+    private(set) var backdropURL: URL?
+    private(set) var logoURL: URL?
+
+    private(set) var episodePlaylist: EpisodePlaylist?
+
+    private(set) var stats = SwarmStats()
+    /// Enough is downloaded to begin; the loading screen offers "Play now".
+    private(set) var canStartNow = false
+    /// Starting is slow and another good source exists: the loading screen
+    /// offers "Try another source".
+    private(set) var canTryAnotherSource = false
+
+    @ObservationIgnored private var session: LibtorrentSession?
+    @ObservationIgnored private var prepareTask: Task<Void, Never>?
+    @ObservationIgnored private var statsTask: Task<Void, Never>?
+    @ObservationIgnored private var streamDirectory: URL?
+    @ObservationIgnored private var startNowRequested = false
+    @ObservationIgnored private var reservedTorrent: String?
+    @ObservationIgnored private var currentStreamID: String?
+    /// What's streaming now, to keep it as a download if it finishes.
+    @ObservationIgnored private var currentStream: TorrentStream?
+    @ObservationIgnored private var currentProgress: WatchProgressContext?
+    @ObservationIgnored private var switchToNextSource: (() -> Void)?
+    @ObservationIgnored private var offerTask: Task<Void, Never>?
+    @ObservationIgnored private let settings: AppSettings
+
+    static var streamCacheRoot: URL { StreamCache.root }
+
+    static func pruneCacheAtLaunch() {
+        StreamCache.removeLegacyLocation()
+        let limit = AppSettings.shared.streamCacheLimitBytes
+        limit > 0 ? StreamCache.prune(toBytes: limit) : StreamCache.clear()
+    }
+
+    static func purgeStreamCache() { StreamCache.clear() }
+
+    init(settings: AppSettings? = nil) {
+        self.settings = settings ?? .shared
+    }
+
+    deinit {
+        prepareTask?.cancel()
+        statsTask?.cancel()
+    }
+
+    var isPreparing: Bool { preparing != nil }
+
+    /// Skip the rest of the cushion and start with what's downloaded.
+    func startNow() { startNowRequested = true }
+
+    /// The viewer gave up on this source: note it (it sinks in the list for
+    /// this session) and start the next best one.
+    func tryAnotherSource() {
+        guard let next = switchToNextSource else { return }
+        if let id = currentStreamID { Task { await SwarmHealth.shared.markFailed(id) } }
+        next()
+    }
+
+    var preparingStatus: String? {
+        if let preparing { return preparing }
+        guard bufferProgress != nil, errorMessage == nil else { return nil }
+        guard stats.connectedPeers > 0 else { return tr("Connecting to sources…") }
+        return tr("\(stats.connectedPeers) source\(stats.connectedPeers == 1 ? "" : "s") · \(ByteFormat.rate(stats.downloadRate))")
+    }
+
+    func play(_ stream: TorrentStream, title: String, backdropURL: URL?, logoURL: URL? = nil,
+              subtitleContext: SubtitleContext? = nil, episodes: EpisodePlaylist? = nil,
+              startAt: Duration = .zero, resumeFraction: Double? = nil,
+              progress: WatchProgressContext? = nil,
+              originalAudioLanguage: String? = nil,
+              fallbacks: [TorrentStream] = []) {
+        let subtitleContext = subtitleContext?.withRelease(stream.title).withSource(SourceKey.make(stream))
+        prefetchSubtitles(subtitleContext)
+        episodePlaylist = episodes
+        prepareTask?.cancel()
+        // The next best source, for a failure here or the viewer's "Try another source".
+        let hasFallback = !fallbacks.isEmpty
+        currentStreamID = stream.id
+        switchToNextSource = fallbacks.first.map { next in
+            { [weak self] in
+                guard let self else { return }
+                self.play(next, title: title, backdropURL: backdropURL, logoURL: logoURL,
+                          subtitleContext: subtitleContext, episodes: episodes,
+                          startAt: startAt, resumeFraction: resumeFraction,
+                          progress: progress, originalAudioLanguage: originalAudioLanguage,
+                          fallbacks: Array(fallbacks.dropFirst()))
+                self.preparing = tr("Trying the next best source…")
+            }
+        }
+        canTryAnotherSource = false
+        offerTask?.cancel()
+        if hasFallback {
+            offerTask = Task { [weak self] in
+                try? await Task.sleep(for: .seconds(10))
+                guard !Task.isCancelled, let self, self.target == nil, self.errorMessage == nil else { return }
+                self.canTryAnotherSource = true
+            }
+        }
+        let previousSession = session
+        let previousDirectory = streamDirectory
+        let previousStream = currentStream
+        let previousProgress = currentProgress
+        session = nil
+        streamDirectory = nil
+        currentStream = stream
+        currentProgress = progress
+
+        self.title = title
+        self.backdropURL = backdropURL
+        self.logoURL = logoURL
+        self.errorMessage = nil
+        self.target = nil
+        self.stats = SwarmStats()
+        self.preparing = tr("Fetching sources from peers…")
+        self.bufferProgress = nil
+        self.isPresenting = true
+
+        prepareTask = Task { [settings] in
+            let cacheLimit = settings.streamCacheLimitBytes
+            let directory = Self.streamCacheRoot
+                .appendingPathComponent(stream.id, isDirectory: true)
+            if let previousSession {
+                // The next episode of the same pack keeps using the folder, so
+                // the finished file's cache copy stays until later.
+                await Self.endSession(previousSession, stream: previousStream, progress: previousProgress,
+                                      directory: previousDirectory, keepFolder: previousDirectory == directory,
+                                      waitForEngine: cacheLimit <= 0 || previousDirectory == directory,
+                                      settings: settings)
+            }
+            if cacheLimit <= 0, let previousDirectory {
+                try? FileManager.default.removeItem(at: previousDirectory)
+            }
+            guard !Task.isCancelled else { return }
+            do {
+                // One engine per torrent: park any download of the same season
+                // pack while it streams, and hand it back afterwards.
+                let key = stream.id.lowercased()
+                if let previous = self.reservedTorrent, previous != key {
+                    DownloadStore.shared.endStreaming(infoHash: previous)
+                }
+                self.reservedTorrent = key
+                await DownloadStore.shared.reserveForStreaming(infoHash: key)
+                guard !Task.isCancelled else { return }
+                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+                self.streamDirectory = directory
+                if cacheLimit > 0 { StreamCache.prune(toBytes: cacheLimit, keeping: [stream.id]) }
+
+                // With another source to fall back on, a torrent nobody answers
+                // for is dropped after 15 s instead of 40.
+                let session = try await LibtorrentSession.resolve(
+                    magnet: stream.magnet,
+                    downloadDirectory: directory,
+                    preferredFileIndex: stream.fileIndex,
+                    timeout: hasFallback ? 30 : 45,
+                    noPeerTimeout: hasFallback ? 15 : nil,
+                    maxPeers: settings.maxPeers,
+                    extraTrackers: settings.customTrackerURLs)
+                guard !Task.isCancelled else { await session.stop(); return }
+                self.session = session
+
+                preparing = tr("Starting stream…")
+                let url = try await session.startStreaming(port: UInt16(settings.streamingPort),
+                                                           resumeFraction: resumeFraction)
+                guard !Task.isCancelled else { await session.stop(); return }
+
+                let started = Date()
+                preparing = nil
+                var lastBytes: Int64 = 0
+                var lastProgressAt = Date()
+                var readyToStart = false
+                var minimumReadyAt: Date?
+                startNowRequested = false
+                canStartNow = false
+
+                let fileLength = await session.streamFileLength()
+                let megabyte: Int64 = 1_048_576
+                let startOffset: Int64 = resumeFraction.map { fraction in
+                    fraction > 0 && fraction < 1 ? Int64(Double(fileLength) * fraction) : 0
+                } ?? 0
+                let headerBytes = min(fileLength, 2 * megabyte)
+                let minimumBytes = min(fileLength - startOffset, 4 * megabyte)
+                let cushionBytes = min(fileLength - startOffset,
+                                       max(8 * megabyte, min(24 * megabyte, fileLength / 80)))
+                let estimatedBitrate = Double(max(fileLength, 1)) / (45 * 60)
+
+                while !Task.isCancelled {
+                    let header = await session.contiguousBytes(from: 0, limit: headerBytes)
+                    let ahead = await session.contiguousBytes(from: startOffset, limit: cushionBytes)
+                    let stats = await session.currentStats()
+                    self.stats = stats
+                    bufferProgress = cushionBytes > 0 ? Double(ahead) / Double(cushionBytes) : 1
+                    if stats.downloadedBytes > lastBytes {
+                        lastBytes = stats.downloadedBytes
+                        lastProgressAt = Date()
+                    }
+                    let elapsed = Date().timeIntervalSince(started)
+                    let stalledFor = Date().timeIntervalSince(lastProgressAt)
+
+                    let minimumReady = header >= headerBytes && ahead >= minimumBytes
+                    canStartNow = minimumReady
+                    if minimumReady {
+                        let since = Date().timeIntervalSince(minimumReadyAt ?? Date())
+                        if minimumReadyAt == nil { minimumReadyAt = Date() }
+                        let keepingUp = stats.downloadRate >= estimatedBitrate * 1.3
+                        if ahead >= cushionBytes || keepingUp || startNowRequested || since >= 8 {
+                            readyToStart = true
+                            break
+                        }
+                    }
+                    if elapsed > 300 { break }                   // absolute ceiling: 5 min
+                    // Nothing arriving: move on sooner when there's a next source.
+                    if lastBytes == 0 {
+                        if stats.connectedPeers == 0, elapsed > (hasFallback ? 25 : 120) { break }
+                        if hasFallback, elapsed > 45 { break }
+                    } else if stalledFor > (hasFallback ? 40 : 90) {
+                        break
+                    }
+                    try? await Task.sleep(for: .milliseconds(300))
+                }
+                canStartNow = false
+                guard !Task.isCancelled else { await session.stop(); return }
+                if !readyToStart {
+                    await session.stop()
+                    self.session = nil
+                    throw TorrentEngineError.bufferTimeout
+                }
+                await session.endPrebuffer()
+
+                canTryAnotherSource = false
+                offerTask?.cancel()
+                if let progress {
+                    SourceMemory.remember(stream, mediaID: progress.mediaID,
+                                          season: progress.season, episode: progress.episode)
+                }
+                target = Target(url: url, title: title, showsTorrentStats: true,
+                                subtitleContext: subtitleContext,
+                                startPosition: startAt, progress: progress,
+                                originalAudioLanguage: originalAudioLanguage)
+                preparing = nil
+                pollStats(from: session)
+            } catch {
+                guard !Task.isCancelled else { return }
+                if error is TorrentEngineError, let next = switchToNextSource {
+                    Task { await SwarmHealth.shared.markFailed(stream.id) }
+                    next()
+                    return
+                }
+                canTryAnotherSource = false
+                preparing = nil
+                errorMessage = friendlyError(error)
+            }
+        }
+    }
+
+    func playDebrid(url: URL, title: String, backdropURL: URL?, logoURL: URL? = nil,
+                    subtitleContext: SubtitleContext? = nil, episodes: EpisodePlaylist? = nil,
+                    startAt: Duration = .zero, progress: WatchProgressContext? = nil,
+                    originalAudioLanguage: String? = nil) {
+        prefetchSubtitles(subtitleContext)
+        episodePlaylist = episodes
+        prepareTask?.cancel()
+        self.title = title
+        self.backdropURL = backdropURL
+        self.logoURL = logoURL
+        self.errorMessage = nil
+        self.preparing = nil
+        self.stats = SwarmStats()
+        self.isPresenting = true
+        self.target = Target(url: url, title: title, showsTorrentStats: false,
+                             subtitleContext: subtitleContext,
+                             startPosition: startAt, progress: progress,
+                             originalAudioLanguage: originalAudioLanguage)
+    }
+
+    func playLocalFile(at url: URL, title: String, subtitleContext: SubtitleContext? = nil,
+                       episodes: EpisodePlaylist? = nil,
+                       startAt: Duration = .zero, progress: WatchProgressContext? = nil,
+                       originalAudioLanguage: String? = nil) {
+        stop()   // a streamed episode may be playing before this downloaded one
+        prefetchSubtitles(subtitleContext)
+        episodePlaylist = episodes
+        self.title = title
+        self.isPresenting = true
+        self.target = Target(url: url, title: title, showsTorrentStats: false,
+                             subtitleContext: subtitleContext,
+                             startPosition: startAt, progress: progress,
+                             originalAudioLanguage: originalAudioLanguage)
+    }
+
+    private func prefetchSubtitles(_ context: SubtitleContext?) {
+        guard let context else { return }
+        let memory = SubtitleMemory.entry(for: context)
+        var preferredID: String?
+        if let key = memory?.trackKey, key.hasPrefix("ext:") { preferredID = String(key.dropFirst(4)) }
+        let language = memory?.language ?? SubtitleMemory.episodeLanguage(for: context)
+            ?? settings.preferredSubtitleLanguage
+        guard !language.isEmpty else { return }
+        Task.detached(priority: .userInitiated) {
+            await SubtitlesProvider.shared.prefetch(context: context, preferredLanguage: language,
+                                                    preferredID: preferredID)
+        }
+    }
+
+    func stop() {
+        prepareTask?.cancel(); prepareTask = nil
+        statsTask?.cancel(); statsTask = nil
+        offerTask?.cancel(); offerTask = nil
+        switchToNextSource = nil
+        currentStreamID = nil
+        canTryAnotherSource = false
+        preparing = nil
+        bufferProgress = nil
+        errorMessage = nil
+        target = nil
+        backdropURL = nil
+        logoURL = nil
+        episodePlaylist = nil
+        isPresenting = false
+        stats = SwarmStats()
+
+        let finished = session
+        let directory = streamDirectory
+        let cacheLimit = settings.streamCacheLimitBytes
+        let reserved = reservedTorrent
+        let finishedStream = currentStream
+        let finishedProgress = currentProgress
+        session = nil
+        streamDirectory = nil
+        reservedTorrent = nil
+        currentStream = nil
+        currentProgress = nil
+        canStartNow = false
+        Task { [settings] in
+            if let finished {
+                await Self.endSession(finished, stream: finishedStream, progress: finishedProgress,
+                                      directory: directory, keepFolder: false, waitForEngine: true,
+                                      settings: settings)
+            }
+            if cacheLimit <= 0 {
+                if let directory { try? FileManager.default.removeItem(at: directory) }
+            } else {
+                StreamCache.prune(toBytes: cacheLimit)
+            }
+            if let reserved { DownloadStore.shared.endStreaming(infoHash: reserved) }
+        }
+    }
+
+    private static func endSession(_ session: LibtorrentSession, stream: TorrentStream?,
+                                   progress: WatchProgressContext?, directory: URL?,
+                                   keepFolder: Bool, waitForEngine: Bool, settings: AppSettings) async {
+        let complete = await session.currentStats().isComplete
+        let file = await session.localFileURL()
+        let relativePath = await session.localRelativePath()
+        await session.stop()
+        let keeping = complete && settings.keepFinishedStreams && stream != nil && progress != nil
+        if keeping || waitForEngine { await session.waitForTeardown() }
+        guard keeping, let stream, let progress, let relativePath,
+              FileManager.default.fileExists(atPath: file.path) else { return }
+        let episodeLabel: String? = {
+            guard let season = progress.season, let episode = progress.episode else { return nil }
+            return "S\(season)E\(episode)"
+        }()
+        let kept = DownloadStore.shared.adoptStreamedFile(
+            at: file, relativePath: relativePath, stream: stream, title: progress.title,
+            mediaID: progress.mediaID, mediaType: progress.mediaType,
+            posterURL: progress.posterURL, episodeLabel: episodeLabel)
+        guard kept, !keepFolder, let directory else { return }
+        let fm = FileManager.default
+        try? fm.removeItem(at: file)
+        try? fm.removeItem(at: directory.appendingPathComponent(".ltresume"))
+        let remaining = (fm.enumerator(at: directory, includingPropertiesForKeys: [.fileSizeKey])?
+            .compactMap { ($0 as? URL).flatMap { try? $0.resourceValues(forKeys: [.fileSizeKey]).fileSize } }
+            .reduce(0, +)) ?? 0
+        if remaining < 32 * 1_048_576 { try? fm.removeItem(at: directory) }
+    }
+
+    func revive() {
+        guard let session else { return }
+        Task { await session.reviveServer() }
+    }
+
+    func recoveryURL() async -> URL? {
+        guard let session, let target else { return nil }
+        if await session.currentStats().isComplete {
+            let file = await session.localFileURL()
+            if FileManager.default.fileExists(atPath: file.path) { return file }
+        }
+        await session.reviveServer()
+        return target.url
+    }
+
+    private func pollStats(from session: LibtorrentSession) {
+        statsTask?.cancel()
+        statsTask = Task { [weak self] in
+            while !Task.isCancelled {
+                let current = await session.currentStats()
+                guard !Task.isCancelled, let self else { return }
+                self.stats = current
+                try? await Task.sleep(for: .seconds(1))
+            }
+        }
+    }
+
+    private func friendlyError(_ error: Error) -> String {
+        if let engineError = error as? TorrentEngineError {
+            switch engineError {
+            case .failedToStart:
+                return tr("This torrent link could not be started. Try a different source.")
+            case .metadataTimeout:
+                return tr("Couldn’t reach enough peers for this release. Try a different source; one with more seeders usually connects faster.")
+            case .noPlayableFile:
+                return tr("This release has no playable video file.")
+            case .bufferTimeout:
+                return tr("This release isn’t serving data — no seeders reachable right now. Try another source with more seeders.")
+            }
+        }
+        return error.localizedDescription
+    }
+}

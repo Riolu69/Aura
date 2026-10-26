@@ -1,0 +1,24 @@
+{
+  "originHash" : "cb4a57e15e30676fca5440d8503324fb95a89c632b541391012395cbc8c58b05",
+  "pins" : [
+    {
+      "identity" : "kingfisher",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/onevcat/Kingfisher.git",
+      "state" : {
+        "revision" : "410984bf301f4fa224fe56277b3f8672cc465c79",
+        "version" : "8.11.0"
+      }
+    },
+    {
+      "identity" : "swiftvlc",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/harflabs/SwiftVLC.git",
+      "state" : {
+        "branch" : "main",
+        "revision" : "f0da22b7944deddf855882e1cbb627f8f486f683"
+      }
+    }
+  ],
+  "version" : 3
+}
